@@ -217,7 +217,8 @@ class PropertyAnalyzer:
             opex = (p.property_tax_annual + p.insurance_annual + mgmt + maint
                     + p.hoa_monthly * 12 + p.utilities_monthly * 12 + p.other_expenses_monthly * 12)
             noi = egi - opex
-            cf = noi - self.annual_debt_service
+            debt_service = self.annual_debt_service if year <= p.loan_term_years else 0
+            cf = noi - debt_service
             cum_cf += cf
 
             idx = min(year * 12 - 1, len(self.amortization) - 1)
@@ -269,9 +270,10 @@ class PropertyAnalyzer:
         if not self.projections:
             return 0
         try:
-            # npf.npv discounts index-0 by (1+r)^1, so pass only future flows
-            # and subtract the t=0 investment separately to avoid double-discounting.
-            return float(npf.npv(discount_rate, self._future_cash_flows())) - self.total_cash_invested
+            # npf.npv(r, [v0,v1,...]) = v0 + v1/(1+r) + v2/(1+r)^2 + ...
+            # Index-0 is at t=0 (not discounted). Passing [-init, f1, ..., fN]
+            # gives the standard financial NPV with the investment at t=0.
+            return float(npf.npv(discount_rate, [-self.total_cash_invested] + self._future_cash_flows()))
         except Exception:
             return 0
 
