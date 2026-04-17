@@ -14,13 +14,13 @@ import sys
 import math
 import argparse
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter, column_index_from_string
+    from openpyxl.utils import get_column_letter
 except ImportError:
     sys.exit("Missing: pip install openpyxl")
 
@@ -205,9 +205,9 @@ class PropertyAnalyzer:
         cum_cf = 0.0
 
         for year in range(1, p.holding_period_years + 1):
+            prop_value *= (1 + p.appreciation_rate_pct / 100)
             if year > 1:
                 rent *= (1 + p.rent_growth_rate_pct / 100)
-                prop_value *= (1 + p.appreciation_rate_pct / 100)
 
             gross = (rent + p.other_monthly_income) * 12
             vacancy = gross * p.vacancy_rate_pct / 100
@@ -244,32 +244,34 @@ class PropertyAnalyzer:
             })
         return rows
 
-    def _calc_irr(self):
-        if not self.projections:
-            return None
-        cash_flows = [-self.total_cash_invested]
+    def _future_cash_flows(self):
+        """Annual cash flows for years 1..N, with terminal sale proceeds added to year N."""
+        flows = []
         for i, row in enumerate(self.projections):
             cf = row["annual_cash_flow"]
             if i == len(self.projections) - 1:
                 cf += row["net_sale_proceeds"]
-            cash_flows.append(cf)
+            flows.append(cf)
+        return flows
+
+    def _calc_irr(self):
+        if not self.projections:
+            return None
         try:
-            result = npf.irr(cash_flows)
-            return result * 100 if result is not None and not math.isnan(result) else None
+            result = npf.irr([-self.total_cash_invested] + self._future_cash_flows())
+            if result is None or math.isnan(result) or math.isinf(result):
+                return None
+            return result * 100
         except Exception:
             return None
 
     def _calc_npv(self, discount_rate):
         if not self.projections:
             return 0
-        cash_flows = [-self.total_cash_invested]
-        for i, row in enumerate(self.projections):
-            cf = row["annual_cash_flow"]
-            if i == len(self.projections) - 1:
-                cf += row["net_sale_proceeds"]
-            cash_flows.append(cf)
         try:
-            return float(npf.npv(discount_rate, cash_flows))
+            # npf.npv discounts index-0 by (1+r)^1, so pass only future flows
+            # and subtract the t=0 investment separately to avoid double-discounting.
+            return float(npf.npv(discount_rate, self._future_cash_flows())) - self.total_cash_invested
         except Exception:
             return 0
 
@@ -505,8 +507,15 @@ class ExcelBuilder:
 
     # ── PROPERTY SHEET ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _safe_sheet_name(name: str) -> str:
+        for ch in r'\/?*[]':
+            name = name.replace(ch, "-")
+        name = name.replace(":", "-")
+        return name[:31]
+
     def _build_property_sheet(self, prop: Property, a: PropertyAnalyzer):
-        ws = self.wb.create_sheet(prop.name[:31])
+        ws = self.wb.create_sheet(self._safe_sheet_name(prop.name))
         ws.sheet_properties.tabColor = C["blue"]
 
         # Column widths
@@ -692,7 +701,6 @@ class ExcelBuilder:
                 sc(c, sz=9, bg=bg, ha="right", border=True, nf=nf)
 
         # Annual summary rows (all years)
-        prop_value_now = a.p.purchase_price
         for yr in range(1, a.p.loan_term_years + 1):
             idx = yr * 12 - 1
             if idx >= len(a.amortization):
@@ -752,7 +760,7 @@ class ExcelBuilder:
                 c = ws.cell(row=dr, column=col, value=val)
                 sc(c, sz=9, bg=bg, ha="right", border=True, nf=nf)
                 if col in (6, 9):
-                    col_r = C["mid_green"] if (val >= 0 if nf != "0.00%" else val >= 0) else C["red"]
+                    col_r = C["mid_green"] if val >= 0 else C["red"]
                     c.font = Font(size=9, bold=True, color=col_r, name="Calibri")
 
         proj_end = proj_row + len(a.projections) + 3
