@@ -79,6 +79,16 @@ class Property:
     selling_costs_pct: float = 6.0      # % of sale price (agents, fees)
     holding_period_years: int = 10
 
+    # Tax & Depreciation
+    land_value_pct: float = 20.0          # % of purchase price that is land (non-depreciable)
+    income_tax_rate_pct: float = 32.0     # marginal combined federal + state tax rate
+    depreciation_years: float = 27.5      # 27.5 residential / 39 commercial
+
+    # Advanced Parameters
+    exit_cap_rate_pct: float = 0.0        # cap-rate exit pricing; 0 = use appreciation model
+    capex_reserve_monthly: float = 0.0    # dedicated CAPEX sinking fund (roof, HVAC, etc.)
+    mirr_reinvest_rate_pct: float = 6.0   # reinvestment rate assumption for MIRR
+
     # Optional metadata
     purchase_date: str = ""
     notes: str = ""
@@ -126,12 +136,16 @@ class PropertyAnalyzer:
         # ── Expenses ────────────────────────────────────────────
         mgmt_fee = self.effective_gross_income * p.management_fee_pct / 100
         maintenance = p.purchase_price * p.maintenance_pct / 100
+        pmi_annual = (self.loan_amount * 0.008) if p.down_payment_pct < 20 and self.loan_amount > 0 else 0.0
+        capex_annual = p.capex_reserve_monthly * 12
 
         self.expense_breakdown = {
             "Property Tax":       p.property_tax_annual,
             "Insurance":          p.insurance_annual,
             "Property Management": mgmt_fee,
             "Maintenance & Repairs": maintenance,
+            "CAPEX Reserve":      capex_annual,
+            "PMI":                pmi_annual,
             "HOA":                p.hoa_monthly * 12,
             "Utilities":          p.utilities_monthly * 12,
             "Other":              p.other_expenses_monthly * 12,
@@ -154,15 +168,43 @@ class PropertyAnalyzer:
         ) if self.gross_annual_income else 0
         self.expense_ratio = (self.total_operating_expenses / self.effective_gross_income * 100) if self.effective_gross_income else 0
         self.price_to_rent = p.purchase_price / (p.monthly_rent * 12) if p.monthly_rent else 0
+        self.debt_yield = (self.noi / self.loan_amount * 100) if self.loan_amount > 0 else 0
 
         # ── Amortization Schedule ───────────────────────────────
         self.amortization = self._build_amortization()
+
+        # ── Depreciation & Tax (Year 1) ─────────────────────────
+        depreciable_basis = p.purchase_price * (1 - p.land_value_pct / 100)
+        self.annual_depreciation = depreciable_basis / p.depreciation_years
+        yr1_interest = sum(row["interest"] for row in self.amortization[:12]) if self.amortization else 0
+        self.taxable_rental_income = (
+            self.effective_gross_income
+            - self.total_operating_expenses
+            - yr1_interest
+            - self.annual_depreciation
+        )
+        tax_liability_yr1 = max(0.0, self.taxable_rental_income) * p.income_tax_rate_pct / 100
+        self.tax_savings_from_depreciation = (
+            self.annual_depreciation * p.income_tax_rate_pct / 100
+            if self.taxable_rental_income < 0 else 0.0
+        )
+        self.after_tax_cash_flow = self.annual_cash_flow - tax_liability_yr1
+        self.after_tax_monthly_cf = self.after_tax_cash_flow / 12
 
         # ── Projections & IRR ───────────────────────────────────
         self.projections = self._build_projections()
         self.irr = self._calc_irr()
         self.npv_at_8 = self._calc_npv(0.08)
         self.npv_at_10 = self._calc_npv(0.10)
+        self.mirr = self._calc_mirr()
+        self.unlevered_irr = self._calc_unlevered_irr()
+
+        # ── Equity Multiple ──────────────────────────────────────
+        if self.projections and self.total_cash_invested:
+            total_dist = sum(r["annual_cash_flow"] for r in self.projections) + self.projections[-1]["net_sale_proceeds"]
+            self.equity_multiple = total_dist / self.total_cash_invested
+        else:
+            self.equity_multiple = None
 
         # ── Equity snapshots ────────────────────────────────────
         def equity_at(year):
@@ -207,6 +249,7 @@ class PropertyAnalyzer:
         rent = p.monthly_rent
         prop_value = p.purchase_price
         cum_cf = 0.0
+        cum_after_tax_cf = 0.0
 
         for year in range(1, p.holding_period_years + 1):
             prop_value *= (1 + p.appreciation_rate_pct / 100)
@@ -218,7 +261,10 @@ class PropertyAnalyzer:
             egi = gross - vacancy
             mgmt = egi * p.management_fee_pct / 100
             maint = prop_value * p.maintenance_pct / 100
+            capex = p.capex_reserve_monthly * 12
+            pmi = (self.loan_amount * 0.008) if p.down_payment_pct < 20 and self.loan_amount > 0 else 0.0
             opex = (p.property_tax_annual + p.insurance_annual + mgmt + maint
+                    + capex + pmi
                     + p.hoa_monthly * 12 + p.utilities_monthly * 12 + p.other_expenses_monthly * 12)
             noi = egi - opex
             debt_service = self.annual_debt_service if year <= p.loan_term_years else 0
@@ -229,23 +275,41 @@ class PropertyAnalyzer:
             loan_bal = self.amortization[idx]["balance"] if self.amortization else 0
             equity = prop_value - loan_bal
 
-            sale_price = prop_value
-            net_proceeds = sale_price * (1 - p.selling_costs_pct / 100) - loan_bal
+            # Exit value: cap-rate model if specified, else appreciation model
+            if p.exit_cap_rate_pct > 0:
+                exit_value = noi / (p.exit_cap_rate_pct / 100)
+            else:
+                exit_value = prop_value
+            net_proceeds = exit_value * (1 - p.selling_costs_pct / 100) - loan_bal
             total_return = cum_cf + net_proceeds - self.total_cash_invested
             roi = total_return / self.total_cash_invested * 100 if self.total_cash_invested else 0
 
+            # After-tax cash flow (simplified: deduct tax on positive taxable income)
+            yr_interest = sum(r["interest"] for r in self.amortization[max(0,(year-1)*12):year*12]) if self.amortization else 0
+            taxable = egi - opex - yr_interest - self.annual_depreciation
+            tax_due = max(0.0, taxable) * p.income_tax_rate_pct / 100
+            after_tax_cf = cf - tax_due
+            cum_after_tax_cf += after_tax_cf
+
+            # Return on Equity (current year)
+            roe = (cf / equity * 100) if equity > 0 else 0.0
+
             rows.append({
-                "year":                year,
-                "prop_value":          prop_value,
-                "loan_balance":        loan_bal,
-                "equity":              equity,
-                "noi":                 noi,
-                "annual_cash_flow":    cf,
+                "year":                 year,
+                "prop_value":           prop_value,
+                "exit_value":           exit_value,
+                "loan_balance":         loan_bal,
+                "equity":               equity,
+                "noi":                  noi,
+                "annual_cash_flow":     cf,
+                "after_tax_cash_flow":  after_tax_cf,
                 "cumulative_cash_flow": cum_cf,
-                "net_sale_proceeds":   net_proceeds,
-                "total_return":        total_return,
-                "roi_if_sold":         roi,
-                "annual_rent":         gross,
+                "cum_after_tax_cf":     cum_after_tax_cf,
+                "net_sale_proceeds":    net_proceeds,
+                "total_return":         total_return,
+                "roi_if_sold":          roi,
+                "roe":                  roe,
+                "annual_rent":          gross,
             })
         return rows
 
@@ -274,12 +338,46 @@ class PropertyAnalyzer:
         if not self.projections:
             return 0
         try:
-            # npf.npv(r, [v0,v1,...]) = v0 + v1/(1+r) + v2/(1+r)^2 + ...
-            # Index-0 is at t=0 (not discounted). Passing [-init, f1, ..., fN]
-            # gives the standard financial NPV with the investment at t=0.
             return float(npf.npv(discount_rate, [-self.total_cash_invested] + self._future_cash_flows()))
         except Exception:
             return 0
+
+    def _calc_mirr(self):
+        if not self.projections:
+            return None
+        try:
+            result = npf.mirr(
+                [-self.total_cash_invested] + self._future_cash_flows(),
+                self.p.interest_rate / 100,
+                self.p.mirr_reinvest_rate_pct / 100,
+            )
+            if result is None or math.isnan(result) or math.isinf(result):
+                return None
+            return result * 100
+        except Exception:
+            return None
+
+    def _calc_unlevered_irr(self):
+        """IRR assuming all-cash purchase — measures property performance without leverage."""
+        if not self.projections:
+            return None
+        try:
+            p = self.p
+            all_cash_in = (p.purchase_price
+                           + p.purchase_price * p.closing_costs_pct / 100
+                           + p.rehab_costs)
+            flows = []
+            for i, row in enumerate(self.projections):
+                cf = row["noi"]
+                if i == len(self.projections) - 1:
+                    cf += row["prop_value"] * (1 - p.selling_costs_pct / 100)
+                flows.append(cf)
+            result = npf.irr([-all_cash_in] + flows)
+            if result is None or math.isnan(result) or math.isinf(result):
+                return None
+            return result * 100
+        except Exception:
+            return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -357,6 +455,14 @@ def sc(cell, *, bold=False, sz=10, fc="000000", italic=False,
         cell.number_format = nf
 
 
+def _modified_property(prop: Property, **overrides) -> Property:
+    """Return a copy of prop with the given field overrides applied."""
+    import dataclasses
+    d = dataclasses.asdict(prop)
+    d.update(overrides)
+    return Property(**d)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EXCEL WORKBOOK BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -374,6 +480,7 @@ class ExcelBuilder:
         self._build_summary()
         for prop, analyzer in zip(self.properties, self.analyzers):
             self._build_property_sheet(prop, analyzer)
+            self._build_sensitivity_sheet(prop, analyzer)
         return self.wb
 
     # ── SUMMARY SHEET ─────────────────────────────────────────────────────────
@@ -532,6 +639,128 @@ class ExcelBuilder:
                 return candidate
             i += 1
 
+    # ── SENSITIVITY ANALYSIS SHEET ────────────────────────────────────────────
+
+    def _build_sensitivity_sheet(self, prop: Property, a: PropertyAnalyzer):
+        sheet_name = self._unique_sheet_name(f"{self._safe_sheet_name(prop.name)[:20]} - Sensitivity")
+        ws = self.wb.create_sheet(sheet_name)
+        ws.sheet_properties.tabColor = C["orange"]
+
+        ws.merge_cells("A1:M1")
+        c = ws["A1"]
+        c.value = f"SENSITIVITY ANALYSIS  —  {prop.name.upper()}"
+        sc(c, bold=True, sz=14, fc=C["white"], bg=C["orange"], ha="center")
+        ws.row_dimensions[1].height = 28
+
+        ws.merge_cells("A2:M2")
+        c = ws["A2"]
+        c.value = "Green = better than base case  |  Red = worse  |  Values show Annual Cash Flow"
+        sc(c, italic=True, sz=9, fc=C["gray"], bg=C["light_gray"], ha="center")
+        ws.row_dimensions[2].height = 14
+
+        col_widths = {"A": 28, "B": 4}
+        for i in range(3, 14):
+            col_widths[get_column_letter(i)] = 14
+        for col, w in col_widths.items():
+            ws.column_dimensions[col].width = w
+
+        def sens_matrix(start_row, title, row_label, row_deltas, col_label, col_deltas,
+                        row_attr, col_attr, metric_fn, cell_nf='"$"#,##0'):
+            """Render one NxM sensitivity table."""
+            r = start_row
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2 + len(col_deltas))
+            c = ws.cell(row=r, column=1, value=title)
+            sc(c, bold=True, sz=11, fc=C["white"], bg=C["navy"], ha="center")
+            ws.row_dimensions[r].height = 22
+            r += 1
+
+            # Column header: col_label
+            ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=2 + len(col_deltas))
+            c = ws.cell(row=r, column=3, value=col_label)
+            sc(c, bold=True, sz=9, fc=C["white"], bg=C["blue"], ha="center")
+            ws.row_dimensions[r].height = 16
+            r += 1
+
+            # Column delta headers
+            c0 = ws.cell(row=r, column=1, value=row_label)
+            sc(c0, bold=True, sz=9, fc=C["white"], bg=C["blue"], ha="center")
+            ws.merge_cells(start_row=r, start_column=1, end_row=r + len(row_deltas), end_column=1)
+            c1 = ws.cell(row=r, column=2, value="Base →")
+            sc(c1, bold=True, sz=8, fc=C["gray"], ha="right")
+            for ci, cd in enumerate(col_deltas):
+                sign = "+" if cd >= 0 else ""
+                c = ws.cell(row=r, column=3 + ci, value=f"{sign}{cd:g}%")
+                sc(c, bold=True, sz=9, bg=C["light_blue"], ha="center", border=True)
+            ws.row_dimensions[r].height = 18
+            r += 1
+
+            base_val = metric_fn(prop, a)
+            for ri, rd in enumerate(row_deltas):
+                sign = "+" if rd >= 0 else ""
+                c = ws.cell(row=r, column=2, value=f"{sign}{rd:g}%")
+                sc(c, bold=True, sz=9, bg=C["light_blue"], ha="center", border=True)
+                ws.row_dimensions[r].height = 17
+                for ci, cd in enumerate(col_deltas):
+                    kw = {row_attr: getattr(prop, row_attr) + rd,
+                          col_attr: getattr(prop, col_attr) + cd}
+                    mod_prop = _modified_property(prop, **kw)
+                    mod_a = PropertyAnalyzer(mod_prop)
+                    val = metric_fn(mod_prop, mod_a)
+                    cell = ws.cell(row=r, column=3 + ci, value=val)
+                    if isinstance(val, float):
+                        sc(cell, sz=9, ha="right", border=True, nf=cell_nf)
+                        diff = val - base_val
+                        if abs(diff) > 0.0001:
+                            cell.fill = _fill(C["light_green"] if diff > 0 else C["light_red"])
+                            cell.font = Font(size=9, bold=True,
+                                             color=C["dark_green"] if diff > 0 else C["red"],
+                                             name="Calibri")
+                    else:
+                        sc(cell, sz=9, ha="right", border=True)
+                r += 1
+            return r + 2
+
+        def annual_cf(p, an):
+            return an.annual_cash_flow
+
+        def coc(p, an):
+            return an.cash_on_cash / 100   # return as decimal for 0.00% formatting
+
+        row = 4
+        # Matrix 1: Vacancy vs Rent change → Annual Cash Flow
+        row = sens_matrix(
+            row,
+            "Annual Cash Flow  —  Vacancy Rate (rows) vs Rent Change (cols)",
+            "Vacancy Δ", [-4, -2, 0, 2, 4],
+            "Monthly Rent Δ", [-10, -5, 0, 5, 10],
+            "vacancy_rate_pct", "monthly_rent",
+            annual_cf,
+        )
+        # Matrix 2: Interest rate vs Down payment → Cash-on-Cash
+        row = sens_matrix(
+            row,
+            "Cash-on-Cash Return  —  Interest Rate Δ (rows) vs Down Payment Δ% (cols)",
+            "Rate Δ", [-1.5, -0.5, 0, 0.5, 1.5],
+            "Down Payment Δ%", [-5, 0, 5, 10, 15],
+            "interest_rate", "down_payment_pct",
+            coc,
+            cell_nf="0.00%",
+        )
+        # Matrix 3: Appreciation rate vs Holding period → Total Return
+        def total_return_final(p, an):
+            return an.projections[-1]["total_return"] if an.projections else 0
+
+        row = sens_matrix(
+            row,
+            "Total Return at Exit  —  Appreciation Rate Δ (rows) vs Rent Growth Δ (cols)",
+            "Apprec. Δ", [-2, -1, 0, 1, 2],
+            "Rent Growth Δ", [-1, 0, 1, 2, 3],
+            "appreciation_rate_pct", "rent_growth_rate_pct",
+            total_return_final,
+        )
+
+        ws.freeze_panes = "A4"
+
     def _build_property_sheet(self, prop: Property, a: PropertyAnalyzer):
         ws = self.wb.create_sheet(self._unique_sheet_name(prop.name))
         ws.sheet_properties.tabColor = C["blue"]
@@ -655,27 +884,48 @@ class ExcelBuilder:
             ws.row_dimensions[r].height = 18
 
         irr_val = a.irr / 100 if a.irr is not None else None
+        mirr_val = a.mirr / 100 if a.mirr is not None else None
+        ulirr_val = a.unlevered_irr / 100 if a.unlevered_irr is not None else None
         roi5 = a.projections[4]["roi_if_sold"] / 100 if len(a.projections) >= 5 else None
         roi10 = a.projections[9]["roi_if_sold"] / 100 if len(a.projections) >= 10 else None
+        roe_yr1 = a.projections[0]["roe"] / 100 if a.projections else None
+        roe_yr5 = a.projections[4]["roe"] / 100 if len(a.projections) >= 5 else None
 
         metrics_list = [
-            ("Net Operating Income (NOI)",   a.noi,                   '"$"#,##0',    0,    None,  True),
-            ("Annual Cash Flow",              a.annual_cash_flow,      '"$"#,##0',    0,    None,  True),
-            ("Monthly Cash Flow",             a.monthly_cash_flow,     '"$"#,##0.00', 0,    None,  True),
-            ("Cap Rate",                      a.cap_rate / 100,        "0.00%",       0.05, 0.03,  True),
-            ("Cash-on-Cash Return (CoC)",     a.cash_on_cash / 100,    "0.00%",       0.08, 0.04,  True),
-            ("IRR",                           irr_val,                 "0.00%",       0.12, 0.06,  True),
-            ("NPV @ 8% Discount Rate",        a.npv_at_8,              '"$"#,##0',    0,    None,  True),
-            ("NPV @ 10% Discount Rate",       a.npv_at_10,             '"$"#,##0',    0,    None,  True),
-            ("Gross Rent Multiplier (GRM)",   a.grm,                   "0.00",        None, None,  False),
-            ("Price-to-Rent Ratio",           a.price_to_rent,         "0.00",        None, None,  False),
-            ("Debt Service Coverage (DSCR)",  a.dscr,                  "0.00",        1.25, 1.0,   True),
-            ("Break-even Occupancy",          a.breakeven_occupancy/100, "0.00%",     None, None,  False),
-            ("Equity Year 1",                 a.equity_year1,          '"$"#,##0',    0,    None,  True),
-            ("Equity Year 5",                 a.equity_year5,          '"$"#,##0',    0,    None,  True),
-            ("Equity Year 10",                a.equity_year10,         '"$"#,##0',    0,    None,  True),
-            ("ROI if Sold Year 5",            roi5,                    "0.00%",       0.15, 0.05,  True),
-            ("ROI if Sold Year 10",           roi10,                   "0.00%",       0.30, 0.10,  True),
+            # ── Cash Flow ──
+            ("Net Operating Income (NOI)",    a.noi,                      '"$"#,##0',    0,    None,  True),
+            ("Annual Cash Flow (Pre-Tax)",     a.annual_cash_flow,         '"$"#,##0',    0,    None,  True),
+            ("After-Tax Cash Flow (Yr 1)",     a.after_tax_cash_flow,      '"$"#,##0',    0,    None,  True),
+            ("Monthly Cash Flow",              a.monthly_cash_flow,        '"$"#,##0.00', 0,    None,  True),
+            # ── Returns ──
+            ("Cap Rate",                       a.cap_rate / 100,           "0.00%",       0.05, 0.03,  True),
+            ("Cash-on-Cash Return (CoC)",      a.cash_on_cash / 100,       "0.00%",       0.08, 0.04,  True),
+            ("IRR (Levered)",                  irr_val,                    "0.00%",       0.12, 0.06,  True),
+            ("MIRR",                           mirr_val,                   "0.00%",       0.10, 0.05,  True),
+            ("Unlevered IRR (All-Cash)",        ulirr_val,                  "0.00%",       0.07, 0.04,  True),
+            ("NPV @ 8% Discount Rate",         a.npv_at_8,                 '"$"#,##0',    0,    None,  True),
+            ("NPV @ 10% Discount Rate",        a.npv_at_10,                '"$"#,##0',    0,    None,  True),
+            ("Equity Multiple",                a.equity_multiple,          "0.00x",       1.5,  1.0,   True),
+            # ── Valuation ──
+            ("Gross Rent Multiplier (GRM)",    a.grm,                      "0.00",        None, None,  False),
+            ("Price-to-Rent Ratio",            a.price_to_rent,            "0.00",        None, None,  False),
+            # ── Risk ──
+            ("Debt Service Coverage (DSCR)",   a.dscr,                     "0.00",        1.25, 1.0,   True),
+            ("Debt Yield",                     a.debt_yield / 100,         "0.00%",       0.08, 0.06,  True),
+            ("Break-even Occupancy",           a.breakeven_occupancy/100,  "0.00%",       None, None,  False),
+            ("Expense Ratio",                  a.expense_ratio / 100,      "0.00%",       None, None,  False),
+            # ── Tax & Depreciation ──
+            ("Annual Depreciation",            a.annual_depreciation,      '"$"#,##0',    None, None,  True),
+            ("Taxable Rental Income (Yr 1)",   a.taxable_rental_income,    '"$"#,##0',    None, None,  True),
+            # ── Equity & ROE ──
+            ("Return on Equity Year 1",        roe_yr1,                    "0.00%",       0.06, 0.03,  True),
+            ("Return on Equity Year 5",        roe_yr5,                    "0.00%",       0.06, 0.03,  True),
+            ("Equity Year 1",                  a.equity_year1,             '"$"#,##0',    0,    None,  True),
+            ("Equity Year 5",                  a.equity_year5,             '"$"#,##0',    0,    None,  True),
+            ("Equity Year 10",                 a.equity_year10,            '"$"#,##0',    0,    None,  True),
+            # ── Exit ──
+            ("ROI if Sold Year 5",             roi5,                       "0.00%",       0.15, 0.05,  True),
+            ("ROI if Sold Year 10",            roi10,                      "0.00%",       0.30, 0.10,  True),
         ]
         for lbl, val, nf, good, bad, higher in metrics_list:
             metric(rr, lbl, val, nf, good, bad, higher)
@@ -747,13 +997,14 @@ class ExcelBuilder:
         ws.row_dimensions[proj_row].height = 8
         proj_row += 1
 
-        sec_header(proj_row, 1, 10, f"{a.p.holding_period_years}-YEAR INVESTMENT PROJECTION", color=C["dark_green"])
+        sec_header(proj_row, 1, 13, f"{a.p.holding_period_years}-YEAR INVESTMENT PROJECTION", color=C["dark_green"])
         proj_row += 1
         ws.row_dimensions[proj_row].height = 22
 
         proj_heads = ["Year", "Property Value", "Loan Balance", "Equity",
-                      "Annual NOI", "Annual Cash Flow", "Cumulative CF",
-                      "Net Sale Proceeds", "Total Return", "ROI if Sold"]
+                      "Annual NOI", "Pre-Tax CF", "After-Tax CF", "Cum. CF",
+                      "Net Sale Proceeds", "Total Return", "ROI if Sold",
+                      "ROE", "Exit Value"]
         for col, h in enumerate(proj_heads, 1):
             c = ws.cell(row=proj_row, column=col, value=h)
             sc(c, bold=True, sz=9, fc=C["white"], bg=C["mid_green"], ha="center", border=True)
@@ -763,21 +1014,24 @@ class ExcelBuilder:
             bg = C["white"] if i % 2 == 0 else C["light_green"]
             ws.row_dimensions[dr].height = 17
             vals = [
-                (prow["year"],               "0"),
-                (prow["prop_value"],         '"$"#,##0'),
-                (prow["loan_balance"],       '"$"#,##0'),
-                (prow["equity"],             '"$"#,##0'),
-                (prow["noi"],                '"$"#,##0'),
-                (prow["annual_cash_flow"],   '"$"#,##0'),
-                (prow["cumulative_cash_flow"], '"$"#,##0'),
-                (prow["net_sale_proceeds"],  '"$"#,##0'),
-                (prow["total_return"],       '"$"#,##0'),
-                (prow["roi_if_sold"] / 100,  "0.00%"),
+                (prow["year"],                  "0"),
+                (prow["prop_value"],             '"$"#,##0'),
+                (prow["loan_balance"],           '"$"#,##0'),
+                (prow["equity"],                 '"$"#,##0'),
+                (prow["noi"],                    '"$"#,##0'),
+                (prow["annual_cash_flow"],       '"$"#,##0'),
+                (prow["after_tax_cash_flow"],    '"$"#,##0'),
+                (prow["cumulative_cash_flow"],   '"$"#,##0'),
+                (prow["net_sale_proceeds"],      '"$"#,##0'),
+                (prow["total_return"],           '"$"#,##0'),
+                (prow["roi_if_sold"] / 100,      "0.00%"),
+                (prow["roe"] / 100,              "0.00%"),
+                (prow["exit_value"],             '"$"#,##0'),
             ]
             for col, (val, nf) in enumerate(vals, 1):
                 c = ws.cell(row=dr, column=col, value=val)
                 sc(c, sz=9, bg=bg, ha="right", border=True, nf=nf)
-                if col in (6, 9):
+                if col in (6, 7, 10):
                     col_r = C["mid_green"] if val >= 0 else C["red"]
                     c.font = Font(size=9, bold=True, color=col_r, name="Calibri")
 
@@ -813,9 +1067,13 @@ SAMPLE_PROPERTIES = [
         insurance_annual=1_500,
         management_fee_pct=8,
         maintenance_pct=1.0,
+        capex_reserve_monthly=200,
         appreciation_rate_pct=4.0,
         rent_growth_rate_pct=3.0,
         holding_period_years=10,
+        land_value_pct=20,
+        income_tax_rate_pct=32,
+        exit_cap_rate_pct=5.5,
         notes="Tech corridor — strong rental demand",
     ),
     Property(
@@ -837,9 +1095,13 @@ SAMPLE_PROPERTIES = [
         insurance_annual=1_800,
         management_fee_pct=8,
         maintenance_pct=1.2,
+        capex_reserve_monthly=300,
         appreciation_rate_pct=3.5,
         rent_growth_rate_pct=2.5,
         holding_period_years=10,
+        land_value_pct=15,
+        income_tax_rate_pct=35,
+        exit_cap_rate_pct=5.0,
         notes="Both units leased, long-term tenants",
     ),
     Property(
@@ -860,9 +1122,13 @@ SAMPLE_PROPERTIES = [
         insurance_annual=1_100,
         management_fee_pct=10,
         maintenance_pct=0.8,
+        capex_reserve_monthly=150,
         appreciation_rate_pct=5.0,
         rent_growth_rate_pct=3.0,
         holding_period_years=10,
+        land_value_pct=25,
+        income_tax_rate_pct=28,
+        exit_cap_rate_pct=6.0,
         notes="New construction, low near-term maintenance",
     ),
 ]
