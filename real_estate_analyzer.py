@@ -104,7 +104,11 @@ class PropertyAnalyzer:
         self.loan_amount = p.purchase_price - self.down_payment
         self.total_cash_invested = self.down_payment + self.closing_costs + p.rehab_costs
 
-        if monthly_rate > 0:
+        self.loan_amount = max(0.0, self.loan_amount)   # clamp: down > price is allowed
+
+        if n == 0:
+            self.monthly_payment = 0.0
+        elif monthly_rate > 0:
             self.monthly_payment = (
                 self.loan_amount * monthly_rate * (1 + monthly_rate) ** n
                 / ((1 + monthly_rate) ** n - 1)
@@ -513,11 +517,23 @@ class ExcelBuilder:
     def _safe_sheet_name(name: str) -> str:
         for ch in r'\/?*[]':
             name = name.replace(ch, "-")
-        name = name.replace(":", "-")
-        return name[:31]
+        name = name.replace(":", "-").strip()
+        return (name or "Property")[:31]
+
+    def _unique_sheet_name(self, raw: str) -> str:
+        base = self._safe_sheet_name(raw)
+        if base not in self.wb.sheetnames:
+            return base
+        i = 2
+        while True:
+            suffix = f" ({i})"
+            candidate = base[:31 - len(suffix)] + suffix
+            if candidate not in self.wb.sheetnames:
+                return candidate
+            i += 1
 
     def _build_property_sheet(self, prop: Property, a: PropertyAnalyzer):
-        ws = self.wb.create_sheet(self._safe_sheet_name(prop.name))
+        ws = self.wb.create_sheet(self._unique_sheet_name(prop.name))
         ws.sheet_properties.tabColor = C["blue"]
 
         # Column widths
@@ -630,10 +646,10 @@ class ExcelBuilder:
             if good is not None and value is not None:
                 if higher:
                     fc = (C["mid_green"] if value >= good
-                          else C["red"] if bad and value < bad else C["orange"])
+                          else C["red"] if bad is not None and value < bad else C["orange"])
                 else:
                     fc = (C["mid_green"] if value <= good
-                          else C["red"] if bad and value > bad else C["orange"])
+                          else C["red"] if bad is not None and value > bad else C["orange"])
             if fc:
                 cv.font = Font(size=10, bold=True, color=fc, name="Calibri")
             ws.row_dimensions[r].height = 18
